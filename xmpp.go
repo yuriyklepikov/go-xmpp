@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 const (
@@ -43,6 +44,9 @@ const (
 
 // Default TLS configuration options
 var DefaultConfig tls.Config
+
+// DebugWriter is the writer used to write debugging output to.
+var DebugWriter io.Writer = os.Stderr
 
 // Cookie is a unique XMPP session identifier
 type Cookie uint64
@@ -63,22 +67,48 @@ type Client struct {
 	p      *xml.Decoder
 }
 
+func (c *Client) JID() string {
+	return c.jid
+}
+
+func containsIgnoreCase(s, substr string) bool {
+	s, substr = strings.ToUpper(s), strings.ToUpper(substr)
+	return strings.Contains(s, substr)
+}
+
 func connect(host, user, passwd string) (net.Conn, error) {
 	addr := host
 
 	if strings.TrimSpace(host) == "" {
 		a := strings.SplitN(user, "@", 2)
 		if len(a) == 2 {
-			host = a[1]
+			addr = a[1]
 		}
 	}
 	a := strings.SplitN(host, ":", 2)
 	if len(a) == 1 {
-		host += ":5222"
+		addr += ":5222"
 	}
+
 	proxy := os.Getenv("HTTP_PROXY")
 	if proxy == "" {
 		proxy = os.Getenv("http_proxy")
+	}
+	// test for no proxy, takes a comma separated list with substrings to match
+	if proxy != "" {
+		noproxy := os.Getenv("NO_PROXY")
+		if noproxy == "" {
+			noproxy = os.Getenv("no_proxy")
+		}
+		if noproxy != "" {
+			nplist := strings.Split(noproxy, ",")
+			for _, s := range nplist {
+				if containsIgnoreCase(addr, s) {
+					proxy = ""
+					break
+				}
+			}
+		}
 	}
 	if proxy != "" {
 		url, err := url.Parse(proxy)
@@ -86,6 +116,7 @@ func connect(host, user, passwd string) (net.Conn, error) {
 			addr = url.Host
 		}
 	}
+
 	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -126,6 +157,16 @@ type Options struct {
 	// from the server.  Use "" to let the server generate one for your client.
 	Resource string
 
+	// OAuthScope provides go-xmpp the required scope for OAuth2 authentication.
+	OAuthScope string
+
+	// OAuthToken provides go-xmpp with the required OAuth2 token used to authenticate
+	OAuthToken string
+
+	// OAuthXmlNs provides go-xmpp with the required namespaced used for OAuth2 authentication.  This is
+	// provided to the server as the xmlns:auth attribute of the OAuth2 authentication request.
+	OAuthXmlNs string
+
 	// TLS Config
 	TLSConfig *tls.Config
 
@@ -163,6 +204,10 @@ func (o Options) NewClient() (*Client, error) {
 		return nil, err
 	}
 
+	if strings.LastIndex(o.Host, ":") > 0 {
+		host = host[:strings.LastIndex(o.Host, ":")]
+	}
+
 	client := new(Client)
 	if o.NoTLS {
 		client.conn = c
@@ -171,14 +216,13 @@ func (o Options) NewClient() (*Client, error) {
 		if o.TLSConfig != nil {
 			tlsconn = tls.Client(c, o.TLSConfig)
 		} else {
-			DefaultConfig.ServerName = strings.Split(o.User, "@")[1]
-			tlsconn = tls.Client(c, &DefaultConfig)
+			DefaultConfig.ServerName = host
+			newconfig := DefaultConfig
+			newconfig.ServerName = host
+			tlsconn = tls.Client(c, &newconfig)
 		}
 		if err = tlsconn.Handshake(); err != nil {
 			return nil, err
-		}
-		if strings.LastIndex(o.Host, ":") > 0 {
-			host = host[:strings.LastIndex(o.Host, ":")]
 		}
 		insecureSkipVerify := DefaultConfig.InsecureSkipVerify
 		if o.TLSConfig != nil {
@@ -265,18 +309,17 @@ func cnonce() string {
 }
 
 func (c *Client) init(o *Options) error {
-	if o.Debug {
-		// For debugging: the following causes the plaintext of the connection to be duplicated to stderr.
-		c.p = xml.NewDecoder(tee{c.conn, os.Stderr})
-	} else {
-		c.p = xml.NewDecoder(c.conn)
-	}
 
+	var domain string
+	var user string
 	a := strings.SplitN(o.User, "@", 2)
-	if len(a) != 2 {
-		return errors.New("xmpp: invalid username (want user@domain): " + o.User)
-	}
-	domain := a[1]
+	if len(o.User) > 0 {
+		if len(a) != 2 {
+			return errors.New("xmpp: invalid username (want user@domain): " + o.User)
+		}
+		user = a[0]
+		domain = a[1]
+	} // Otherwise, we'll be attempting ANONYMOUS
 
 	// Declare intent to be a jabber client and gather stream features.
 	f, err := c.startStream(o, domain)
@@ -289,88 +332,98 @@ func (c *Client) init(o *Options) error {
 		return err
 	}
 
-	// Even digest forms of authentication are unsafe if we do not know that the host
-	// we are talking to is the actual server, and not a man in the middle playing
-	// proxy.
-	if !c.IsEncrypted() && !o.InsecureAllowUnencryptedAuth {
-		return errors.New("refusing to authenticate over unencrypted TCP connection")
-	}
-
-	mechanism := ""
-	for _, m := range f.Mechanisms.Mechanism {
-		if m == "ANONYMOUS" {
-			mechanism = m
-			fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='ANONYMOUS' />\n", nsSASL)
-			break
-		}
-
-		a := strings.SplitN(o.User, "@", 2)
-		if len(a) != 2 {
-			return errors.New("xmpp: invalid username (want user@domain): " + o.User)
-		}
-		user := a[0]
-		domain := a[1]
-
-		if m == "PLAIN" {
-			mechanism = m
-			// Plain authentication: send base64-encoded \x00 user \x00 password.
-			raw := "\x00" + user + "\x00" + o.Password
-			enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
-			base64.StdEncoding.Encode(enc, []byte(raw))
-			fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='PLAIN'>%s</auth>\n", nsSASL, enc)
-			break
-		}
-		if m == "DIGEST-MD5" {
-			mechanism = m
-			// Digest-MD5 authentication
-			fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='DIGEST-MD5'/>\n", nsSASL)
-			var ch saslChallenge
-			if err = c.p.DecodeElement(&ch, nil); err != nil {
-				return errors.New("unmarshal <challenge>: " + err.Error())
+	if o.User == "" && o.Password == "" {
+		foundAnonymous := false
+		for _, m := range f.Mechanisms.Mechanism {
+			if m == "ANONYMOUS" {
+				fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='ANONYMOUS' />\n", nsSASL)
+				foundAnonymous = true
+				break
 			}
-			b, err := base64.StdEncoding.DecodeString(string(ch))
-			if err != nil {
-				return err
+		}
+		if !foundAnonymous {
+			return fmt.Errorf("ANONYMOUS authentication is not an option and username and password were not specified")
+		}
+	} else {
+		// Even digest forms of authentication are unsafe if we do not know that the host
+		// we are talking to is the actual server, and not a man in the middle playing
+		// proxy.
+		if !c.IsEncrypted() && !o.InsecureAllowUnencryptedAuth {
+			return errors.New("refusing to authenticate over unencrypted TCP connection")
+		}
+
+		mechanism := ""
+		for _, m := range f.Mechanisms.Mechanism {
+			if m == "X-OAUTH2" && o.OAuthToken != "" && o.OAuthScope != "" {
+				mechanism = m
+				// Oauth authentication: send base64-encoded \x00 user \x00 token.
+				raw := "\x00" + user + "\x00" + o.OAuthToken
+				enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
+				base64.StdEncoding.Encode(enc, []byte(raw))
+				fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='X-OAUTH2' auth:service='oauth2' "+
+					"xmlns:auth='%s'>%s</auth>\n", nsSASL, o.OAuthXmlNs, enc)
+				break
 			}
-			tokens := map[string]string{}
-			for _, token := range strings.Split(string(b), ",") {
-				kv := strings.SplitN(strings.TrimSpace(token), "=", 2)
-				if len(kv) == 2 {
-					if kv[1][0] == '"' && kv[1][len(kv[1])-1] == '"' {
-						kv[1] = kv[1][1 : len(kv[1])-1]
-					}
-					tokens[kv[0]] = kv[1]
+			if m == "PLAIN" {
+				mechanism = m
+				// Plain authentication: send base64-encoded \x00 user \x00 password.
+				raw := "\x00" + user + "\x00" + o.Password
+				enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
+				base64.StdEncoding.Encode(enc, []byte(raw))
+				fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='PLAIN'>%s</auth>\n", nsSASL, enc)
+				break
+			}
+			if m == "DIGEST-MD5" {
+				mechanism = m
+				// Digest-MD5 authentication
+				fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='DIGEST-MD5'/>\n", nsSASL)
+				var ch saslChallenge
+				if err = c.p.DecodeElement(&ch, nil); err != nil {
+					return errors.New("unmarshal <challenge>: " + err.Error())
 				}
-			}
-			realm, _ := tokens["realm"]
-			nonce, _ := tokens["nonce"]
-			qop, _ := tokens["qop"]
-			charset, _ := tokens["charset"]
-			cnonceStr := cnonce()
-			digestURI := "xmpp/" + domain
-			nonceCount := fmt.Sprintf("%08x", 1)
-			digest := saslDigestResponse(user, realm, o.Password, nonce, cnonceStr, "AUTHENTICATE", digestURI, nonceCount)
-			message := "username=\"" + user + "\", realm=\"" + realm + "\", nonce=\"" + nonce + "\", cnonce=\"" + cnonceStr +
-				"\", nc=" + nonceCount + ", qop=" + qop + ", digest-uri=\"" + digestURI + "\", response=" + digest + ", charset=" + charset
+				b, err := base64.StdEncoding.DecodeString(string(ch))
+				if err != nil {
+					return err
+				}
+				tokens := map[string]string{}
+				for _, token := range strings.Split(string(b), ",") {
+					kv := strings.SplitN(strings.TrimSpace(token), "=", 2)
+					if len(kv) == 2 {
+						if kv[1][0] == '"' && kv[1][len(kv[1])-1] == '"' {
+							kv[1] = kv[1][1 : len(kv[1])-1]
+						}
+						tokens[kv[0]] = kv[1]
+					}
+				}
+				realm, _ := tokens["realm"]
+				nonce, _ := tokens["nonce"]
+				qop, _ := tokens["qop"]
+				charset, _ := tokens["charset"]
+				cnonceStr := cnonce()
+				digestURI := "xmpp/" + domain
+				nonceCount := fmt.Sprintf("%08x", 1)
+				digest := saslDigestResponse(user, realm, o.Password, nonce, cnonceStr, "AUTHENTICATE", digestURI, nonceCount)
+				message := "username=\"" + user + "\", realm=\"" + realm + "\", nonce=\"" + nonce + "\", cnonce=\"" + cnonceStr +
+					"\", nc=" + nonceCount + ", qop=" + qop + ", digest-uri=\"" + digestURI + "\", response=" + digest + ", charset=" + charset
 
-			fmt.Fprintf(c.conn, "<response xmlns='%s'>%s</response>\n", nsSASL, base64.StdEncoding.EncodeToString([]byte(message)))
+				fmt.Fprintf(c.conn, "<response xmlns='%s'>%s</response>\n", nsSASL, base64.StdEncoding.EncodeToString([]byte(message)))
 
-			var rspauth saslRspAuth
-			if err = c.p.DecodeElement(&rspauth, nil); err != nil {
-				return errors.New("unmarshal <challenge>: " + err.Error())
+				var rspauth saslRspAuth
+				if err = c.p.DecodeElement(&rspauth, nil); err != nil {
+					return errors.New("unmarshal <challenge>: " + err.Error())
+				}
+				b, err = base64.StdEncoding.DecodeString(string(rspauth))
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(c.conn, "<response xmlns='%s'/>\n", nsSASL)
+				break
 			}
-			b, err = base64.StdEncoding.DecodeString(string(rspauth))
-			if err != nil {
-				return err
-			}
-			fmt.Fprintf(c.conn, "<response xmlns='%s'/>\n", nsSASL)
-			break
+		}
+		if mechanism == "" {
+			return fmt.Errorf("PLAIN authentication is not an option: %v", f.Mechanisms.Mechanism)
 		}
 	}
-	if mechanism == "" {
-		return fmt.Errorf("PLAIN authentication is not an option: %v", f.Mechanisms.Mechanism)
-	}
-
 	// Next message should be either success or failure.
 	name, val, err := next(c.p)
 	if err != nil {
@@ -379,9 +432,13 @@ func (c *Client) init(o *Options) error {
 	switch v := val.(type) {
 	case *saslSuccess:
 	case *saslFailure:
-		// v.Any is type of sub-element in failure,
-		// which gives a description of what failed.
-		return errors.New("auth failure: " + v.Any.Local)
+		errorMessage := v.Text
+		if errorMessage == "" {
+			// v.Any is type of sub-element in failure,
+			// which gives a description of what failed if there was no text element
+			errorMessage = v.Any.Local
+		}
+		return errors.New("auth failure: " + errorMessage)
 	default:
 		return errors.New("expected <success> or <failure>, got <" + name.Local + "> in " + name.Space)
 	}
@@ -392,7 +449,7 @@ func (c *Client) init(o *Options) error {
 		return err
 	}
 
-	// Generate a uniqe cookie
+	// Generate a unique cookie
 	cookie := getCookie()
 
 	// Send IQ message asking to bind to the local user name.
@@ -409,6 +466,7 @@ func (c *Client) init(o *Options) error {
 		return errors.New("<iq> result missing <bind>")
 	}
 	c.jid = iq.Bind.Jid // our local id
+	c.domain = domain
 
 	if o.Session {
 		//if server support session, open it
@@ -469,7 +527,7 @@ func (c *Client) startTLSIfRequired(f *streamFeatures, o *Options, domain string
 // will be returned.
 func (c *Client) startStream(o *Options, domain string) (*streamFeatures, error) {
 	if o.Debug {
-		c.p = xml.NewDecoder(tee{c.conn, os.Stderr})
+		c.p = xml.NewDecoder(tee{c.conn, DebugWriter})
 	} else {
 		c.p = xml.NewDecoder(c.conn)
 	}
@@ -510,18 +568,40 @@ func (c *Client) IsEncrypted() bool {
 
 // Chat is an incoming or outgoing XMPP chat message.
 type Chat struct {
+	Remote    string
+	Type      string
+	Text      string
+	Subject   string
+	Thread    string
+	Roster    Roster
+	Other     []string
+	OtherElem []XMLElement
+	Stamp     time.Time
+}
+
+type Roster []Contact
+
+type Contact struct {
 	Remote string
-	Type   string
-	Text   string
-	Other  []string
+	Name   string
+	Group  []string
 }
 
 // Presence is an XMPP presence notification.
 type Presence struct {
-	From string
-	To   string
-	Type string
-	Show string
+	From   string
+	To     string
+	Type   string
+	Show   string
+	Status string
+}
+
+type IQ struct {
+	ID    string
+	From  string
+	To    string
+	Type  string
+	Query []byte
 }
 
 // Recv waits to receive the next XMPP stanza.
@@ -534,23 +614,71 @@ func (c *Client) Recv() (stanza interface{}, err error) {
 		}
 		switch v := val.(type) {
 		case *clientMessage:
-			return Chat{v.From, v.Type, v.Body, v.Other}, nil
+			stamp, _ := time.Parse(
+				"2006-01-02T15:04:05Z",
+				v.Delay.Stamp,
+			)
+			chat := Chat{
+				Remote:    v.From,
+				Type:      v.Type,
+				Text:      v.Body,
+				Subject:   v.Subject,
+				Thread:    v.Thread,
+				Other:     v.OtherStrings(),
+				OtherElem: v.Other,
+				Stamp:     stamp,
+			}
+			return chat, nil
+		case *clientQuery:
+			var r Roster
+			for _, item := range v.Item {
+				r = append(r, Contact{item.Jid, item.Name, item.Group})
+			}
+			return Chat{Type: "roster", Roster: r}, nil
 		case *clientPresence:
-			return Presence{v.From, v.To, v.Type, v.Show}, nil
+			return Presence{v.From, v.To, v.Type, v.Show, v.Status}, nil
+		case *clientIQ:
+			// TODO check more strictly
+			if bytes.Equal(bytes.TrimSpace(v.Query), []byte(`<ping xmlns='urn:xmpp:ping'/>`)) || bytes.Equal(bytes.TrimSpace(v.Query), []byte(`<ping xmlns="urn:xmpp:ping"/>`)) {
+				err := c.SendResultPing(v.ID, v.From)
+				if err != nil {
+					return Chat{}, err
+				}
+			}
+			return IQ{ID: v.ID, From: v.From, To: v.To, Type: v.Type, Query: v.Query}, nil
 		}
 	}
-	panic("unreachable")
 }
 
 // Send sends the message wrapped inside an XMPP message stanza body.
 func (c *Client) Send(chat Chat) (n int, err error) {
-	return fmt.Fprintf(c.conn, "<message to='%s' type='%s' xml:lang='en'>"+"<body>%s</body></message>",
-		xmlEscape(chat.Remote), xmlEscape(chat.Type), xmlEscape(chat.Text))
+	var subtext = ``
+	var thdtext = ``
+	if chat.Subject != `` {
+		subtext = `<subject>` + xmlEscape(chat.Subject) + `</subject>`
+	}
+	if chat.Thread != `` {
+		thdtext = `<thread>` + xmlEscape(chat.Thread) + `</thread>`
+	}
+
+	stanza := "<message to='%s' type='%s' id='%s' xml:lang='en'>" + subtext + "<body>%s</body>" + thdtext + "</message>"
+
+	return fmt.Fprintf(c.conn, stanza,
+		xmlEscape(chat.Remote), xmlEscape(chat.Type), cnonce(), xmlEscape(chat.Text))
 }
 
 // SendOrg sends the original text without being wrapped in an XMPP message stanza.
 func (c *Client) SendOrg(org string) (n int, err error) {
 	return fmt.Fprint(c.conn, org)
+}
+
+func (c *Client) SendPresence(presence Presence) (n int, err error) {
+	return fmt.Fprintf(c.conn, "<presence from='%s' to='%s'/>", xmlEscape(presence.From), xmlEscape(presence.To))
+}
+
+// SendKeepAlive sends a "whitespace keepalive" as described in chapter 4.6.1 of RFC6120.
+func (c *Client) SendKeepAlive() (n int, err error) {
+	return fmt.Fprintf(c.conn, " ")
 }
 
 // SendHtml sends the message as HTML as defined by XEP-0071
@@ -559,6 +687,12 @@ func (c *Client) SendHtml(chat Chat) (n int, err error) {
 		"<body>%s</body>"+
 		"<html xmlns='http://jabber.org/protocol/xhtml-im'><body xmlns='http://www.w3.org/1999/xhtml'>%s</body></html></message>",
 		xmlEscape(chat.Remote), xmlEscape(chat.Type), xmlEscape(chat.Text), chat.Text)
+}
+
+// Roster asks for the chat roster.
+func (c *Client) Roster() error {
+	fmt.Fprintf(c.conn, "<iq from='%s' type='get' id='roster1'><query xmlns='jabber:iq:roster'/></iq>\n", xmlEscape(c.jid))
+	return nil
 }
 
 // RFC 3920  C.1  Streams name space
@@ -617,7 +751,8 @@ type saslSuccess struct {
 
 type saslFailure struct {
 	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl failure"`
-	Any     xml.Name
+	Any     xml.Name `xml:",any"`
+	Text    string   `xml:"text"`
 }
 
 // RFC 3920  C.5  Resource binding name space
@@ -641,7 +776,48 @@ type clientMessage struct {
 	Thread  string `xml:"thread"`
 
 	// Any hasn't matched element
-	Other []string `xml:",any"`
+	Other []XMLElement `xml:",any"`
+
+	Delay Delay `xml:"delay"`
+}
+
+func (m *clientMessage) OtherStrings() []string {
+	a := make([]string, len(m.Other))
+	for i, e := range m.Other {
+		a[i] = e.String()
+	}
+	return a
+}
+
+type XMLElement struct {
+	XMLName  xml.Name
+	InnerXML string `xml:",innerxml"`
+}
+
+func (e *XMLElement) String() string {
+	r := bytes.NewReader([]byte(e.InnerXML))
+	d := xml.NewDecoder(r)
+	var buf bytes.Buffer
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			break
+		}
+		switch v := tok.(type) {
+		case xml.StartElement:
+			err = d.Skip()
+		case xml.CharData:
+			_, err = buf.Write(v)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return buf.String()
+}
+
+type Delay struct {
+	Stamp string `xml:"stamp,attr"`
 }
 
 type clientText struct {
@@ -657,18 +833,20 @@ type clientPresence struct {
 	Type    string   `xml:"type,attr"` // error, probe, subscribe, subscribed, unavailable, unsubscribe, unsubscribed
 	Lang    string   `xml:"lang,attr"`
 
-	Show     string `xml:"show"`        // away, chat, dnd, xa
-	Status   string `xml:"status,attr"` // sb []clientText
+	Show     string `xml:"show"`   // away, chat, dnd, xa
+	Status   string `xml:"status"` // sb []clientText
 	Priority string `xml:"priority,attr"`
 	Error    *clientError
 }
 
-type clientIQ struct { // info/query
+type clientIQ struct {
+	// info/query
 	XMLName xml.Name `xml:"jabber:client iq"`
-	From    string   `xml:",attr"`
-	ID      string   `xml:",attr"`
-	To      string   `xml:",attr"`
-	Type    string   `xml:",attr"` // error, get, result, set
+	From    string   `xml:"from,attr"`
+	ID      string   `xml:"id,attr"`
+	To      string   `xml:"to,attr"`
+	Type    string   `xml:"type,attr"` // error, get, result, set
+	Query   []byte   `xml:",innerxml"`
 	Error   clientError
 	Bind    bindBind
 }
@@ -681,11 +859,23 @@ type clientError struct {
 	Text    string
 }
 
+type clientQuery struct {
+	Item []rosterItem
+}
+
+type rosterItem struct {
+	XMLName      xml.Name `xml:"jabber:iq:roster item"`
+	Jid          string   `xml:",attr"`
+	Name         string   `xml:",attr"`
+	Subscription string   `xml:",attr"`
+	Group        []string
+}
+
 // Scan XML token stream to find next StartElement.
 func nextStart(p *xml.Decoder) (xml.StartElement, error) {
 	for {
 		t, err := p.Token()
-		if err != nil && err != io.EOF {
+		if err != nil || t == nil {
 			return xml.StartElement{}, err
 		}
 		switch t := t.(type) {
@@ -693,7 +883,6 @@ func nextStart(p *xml.Decoder) (xml.StartElement, error) {
 			return t, nil
 		}
 	}
-	panic("unreachable")
 }
 
 // Scan XML token stream for next element and save into val.
@@ -750,27 +939,14 @@ func next(p *xml.Decoder) (xml.Name, interface{}, error) {
 	if err = p.DecodeElement(nv, &se); err != nil {
 		return xml.Name{}, nil, err
 	}
-	return se.Name, nv, err
-}
 
-var xmlSpecial = map[byte]string{
-	'<':  "&lt;",
-	'>':  "&gt;",
-	'"':  "&quot;",
-	'\'': "&apos;",
-	'&':  "&amp;",
+	return se.Name, nv, err
 }
 
 func xmlEscape(s string) string {
 	var b bytes.Buffer
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if s, ok := xmlSpecial[c]; ok {
-			b.WriteString(s)
-		} else {
-			b.WriteByte(c)
-		}
-	}
+	xml.Escape(&b, []byte(s))
+
 	return b.String()
 }
 
